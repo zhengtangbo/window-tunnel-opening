@@ -1,0 +1,4 @@
+interface:
+  display_name: "窗格隧道打开"
+  short_description: "用视频前九秒自动制作逐格亮起、透视推进和亮边扫开效果"
+  default_prompt: "用 $window-tunnel-opening 给我上传的视频做同款窗格隧道开场。"
