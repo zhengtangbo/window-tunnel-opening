@@ -1,6 +1,7 @@
 """Estimate a visible ground corridor from perspective and appearance across frames."""
 
 from dataclasses import dataclass
+import json
 
 import cv2
 import numpy as np
@@ -19,12 +20,6 @@ class Road:
         rows, left, right = self.edges.T
         return np.interp(y, rows, left), np.interp(y, rows, right)
 
-    def texture_point(self):
-        y = float(self.edges[-1, 0] * 0.72 + self.edges[0, 0] * 0.28)
-        left, right = self.at(y)
-        return (float((left + right) / 2), y)
-
-
 def road_from_points(points):
     if len(points) < 2 or not all(0 <= x <= 1 and 0 <= y <= 1 and 0 < width <= 1 for x, y, width in points):
         raise ValueError("Supply at least two road points as normalized X Y WIDTH triples")
@@ -32,6 +27,28 @@ def road_from_points(points):
     if np.any(np.diff(y) <= 0.001) or y[-1] < 0.80 or y[0] > 0.77:
         raise ValueError("Use distinct rows and mark both a near point and a farther point")
     return Road(np.column_stack((y, center - width / 2, center + width / 2)))
+
+
+def load_track(path, fps, last_frame):
+    items = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(items, list) or not items:
+        raise ValueError("Road track must be a nonempty JSON array of time and edges objects")
+    track = []
+    for item in items:
+        seconds = float(item["time"])
+        edges = np.asarray(item["edges"], dtype=float)
+        if not np.isfinite(seconds) or not 0 <= seconds <= last_frame / fps + 1e-8:
+            raise ValueError("Road keyframe times must be inside the effect, in clip-relative seconds")
+        if (edges.ndim != 2 or edges.shape[1] != 3 or len(edges) < 2
+            or not np.isfinite(edges).all() or not ((0 <= edges) & (edges <= 1)).all()
+            or np.any(np.diff(edges[:, 0]) <= 0) or np.any(edges[:, 2] <= edges[:, 1])
+            or edges[-1, 0] - edges[0, 0] < 0.035):
+            raise ValueError("Each keyframe needs ordered [y, left, right] rows in normalized coordinates")
+        track.append((round(seconds * fps), Road(edges)))
+    track.sort(key=lambda item: item[0])
+    if len({frame for frame, _ in track}) != len(track):
+        raise ValueError("Each tracked road keyframe must use a distinct frame")
+    return track
 
 
 def row_candidates(integral, y, width, height):
@@ -141,26 +158,38 @@ def detect(image):
     if np.max(np.abs(fit(y) - center)) > 0.078:
         return None
     center = 0.7 * fit(y) + 0.3 * center
-    span = 0.55 * np.polynomial.Polynomial.fit(y, span, 2)(y) + 0.45 * span
+    span = np.maximum(0.012, 0.55 * np.polynomial.Polynomial.fit(y, span, 2)(y) + 0.45 * span)
     return Road(np.column_stack((y, center - span / 2, center + span / 2)))
 
 
 def select_track(images):
     hits = []
-    for frame, image in images:
+    for index, (frame, image) in enumerate(images):
         match = detect(image)
         if match is not None:
-            hits.append((frame, match))
+            hits.append((index, frame, match))
     if len(hits) < 2:
         return []
     comparison = np.array([0.73, 0.84, 0.95])
-    centers = np.array([np.mean(road.at(comparison), axis=0) for _, road in hits])
-    support = np.max(np.abs(centers[:, None, :] - centers[None, :, :]), axis=2) < 0.22
-    consensus = np.argmax(support.sum(axis=1))
-    kept = [item for item, keep in zip(hits, support[consensus]) if keep]
-    if len(kept) < max(2, (len(images) + 1) // 2):
+    bounds = np.array([road.at(comparison) for _, _, road in hits])
+    longest = []
+    for i, (index, _, _) in enumerate(hits):
+        # Allow the route to drift across the frame, with continuity between neighbours.
+        previous = [
+            chain for j, chain in enumerate(longest)
+            if index - hits[j][0] <= 3 and np.max(np.abs(bounds[i] - bounds[j])) < 0.24
+        ]
+        longest.append(max(previous, key=len, default=[]) + [i])
+    last = len(images) - 1
+    complete = [
+        chain for chain in longest
+        if hits[chain[0]][0] <= min(2, last // 4)
+        and hits[chain[-1]][0] >= last - min(2, last // 4)
+    ]
+    best = max(complete, key=len, default=[])
+    if len(best) < max(2, (len(images) + 1) // 2):
         return []
-    return kept
+    return [(hits[i][1], hits[i][2]) for i in best]
 
 
 def road_for_frame(track, frame):
@@ -174,6 +203,7 @@ def road_for_frame(track, frame):
         return first
     fraction = (frame - before) / (after - before)
     start = (1 - fraction) * first.edges[0, 0] + fraction * second.edges[0, 0]
-    y = np.linspace(start, 0.98, len(ROWS))
+    end = (1 - fraction) * first.edges[-1, 0] + fraction * second.edges[-1, 0]
+    y = np.linspace(start, end, len(ROWS))
     edges = np.array(first.at(y)) * (1 - fraction) + np.array(second.at(y)) * fraction
     return Road(np.column_stack((y, edges.T)))

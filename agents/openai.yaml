@@ -1,4 +1,4 @@
 interface:
   display_name: "窗格隧道打开"
-  short_description: "用视频前九秒制作窗格开场，让踏板在揭开时自动对齐实景道路"
+  short_description: "按实景路的弯向和宽度生成踏板、窗格及光束，制作同款开场"
   default_prompt: "用 $window-tunnel-opening 给我上传的视频做同款窗格隧道开场。"
