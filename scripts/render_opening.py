@@ -21,6 +21,102 @@ def smooth(lo, hi, value):
     return t * t * (3.0 - 2.0 * t)
 
 
+def road_depth(top, depth):
+    return top + (1.0 - top) / (1.0 + 0.48 * np.maximum(-0.20, depth)) ** 1.24
+
+
+class RoadLayout:
+    def __init__(self, road, width, height):
+        self.road = road
+        self.size = np.array([width, height])
+        self.top = road.edges[0, 0]
+        self.windows = []
+
+    def tread(self, near, far):
+        rows = np.repeat([near, far], 2)
+        left, right = self.road.at(rows)
+        width = right - left
+        inset = np.minimum(0.17 * width, 0.006 + 0.085 * width)
+        x = np.array([left[0] + inset[0], right[1] - inset[1], right[2] - inset[2], left[3] + inset[3]])
+        return np.column_stack((x, rows)) * self.size
+
+    def clear_road(self, polygon, lane):
+        points = polygon / self.size
+        minimum = max(self.top, points[:, 1].min())
+        maximum = min(1.0, points[:, 1].max())
+        if maximum <= minimum:
+            return polygon
+        if lane == 4:
+            return polygon - [0.0, (points[:, 1].max() - self.top + 0.014) * self.size[1]]
+
+        # Each polygon edge and each road boundary is linear between these rows.
+        # Checking their breakpoints keeps the whole pane clear of road and tread gaps.
+        rows = np.unique(np.clip(np.r_[points[:, 1], self.road.edges[:, 0], minimum, maximum], minimum, maximum))
+        following = np.roll(points, -1, axis=0)
+        delta = following - points
+        intersects = ((rows[:, None] >= np.minimum(points[:, 1], following[:, 1]) - 1e-9)
+                      & (rows[:, None] <= np.maximum(points[:, 1], following[:, 1]) + 1e-9))
+        along = (rows[:, None] - points[:, 1]) / np.where(np.abs(delta[:, 1]) > 1e-10, delta[:, 1], 1.0)
+        x = points[:, 0] + delta[:, 0] * np.clip(along, 0.0, 1.0)
+        left, right = self.road.at(rows)
+        gap = 0.009 + 0.070 * (right - left)
+        if lane < 4:
+            inner = np.where(intersects, x, -np.inf).max(axis=1)
+            shift = -max(0.0, np.max(inner - left + gap))
+        else:
+            inner = np.where(intersects, x, np.inf).min(axis=1)
+            shift = max(0.0, np.max(right + gap - inner))
+        return polygon + [shift * self.size[0], 0.0]
+
+    def place_window(self, polygon, lane):
+        def candidate(scale):
+            pane = center + offset * scale
+            return self.clear_road(pane, lane)
+
+        def collision(pane):
+            center = pane.mean(axis=0)
+            expanded = center + (pane - center) * 1.075
+            sides = np.roll(expanded, -1, axis=0) - expanded
+            axes = sides[:, ::-1] * [1, -1]
+            axes /= np.maximum(1e-9, np.linalg.norm(axes, axis=1, keepdims=True))
+            lo, hi = expanded.min(axis=0), expanded.max(axis=0)
+            separation = max(2.0, self.size[0] * 0.0025)
+            for other, other_axes, other_lo, other_hi in self.windows:
+                if np.any(lo - separation > other_hi) or np.any(other_lo - separation > hi):
+                    continue
+                directions = np.vstack((axes, other_axes))
+                first, second = expanded @ directions.T, other @ directions.T
+                gap = np.maximum(first.min(axis=0) - second.max(axis=0), second.min(axis=0) - first.max(axis=0))
+                if np.all(gap < separation):
+                    return expanded, axes, lo, hi, True
+            return expanded, axes, lo, hi, False
+
+        center = polygon.mean(axis=0)
+        offset = polygon - center
+        scale = 0.96
+        pane = candidate(scale)
+        expanded, axes, lo, hi, overlap = collision(pane)
+        if overlap:
+            low, high = 0.43, scale
+            pane = candidate(low)
+            expanded, axes, lo, hi, overlap = collision(pane)
+            if overlap:
+                return None
+            for _ in range(5):
+                trial = (low + high) / 2
+                if collision(candidate(trial))[-1]:
+                    high = trial
+                else:
+                    low = trial
+            scale = low
+            pane = candidate(scale)
+            expanded, axes, lo, hi, _ = collision(pane)
+        if np.any(hi < 0) or np.any(lo > self.size) or cv2.contourArea(pane.astype(np.float32)) < 3.0:
+            return None
+        self.windows.append((expanded, axes, lo, hi))
+        return pane, float(smooth(0.43, 0.72, scale))
+
+
 def make_geometry():
     rng = np.random.default_rng(20261114)
     panels = []
@@ -176,33 +272,34 @@ class Opening:
         strength = (0.32 if lane in (2, 3, 6) else 0.10) * intensity * (0.82 + 0.14 * math.sin(row * 2.0 + lane))
         haze[y0:y1, x0:x1] += patch * (strength / 255.0) * fade
 
-    def road_windows(self, polygon, road, camera, z):
+    def road_window(self, polygon, layout, camera, z):
         depth = max(0, z - camera[0][2])
-        top = road.edges[0, 0]
-        y = top + (1 - top) / (1 + 0.45 * depth) ** 1.20
-        left, right = road.at(y)
+        top = layout.top
+        y = road_depth(top, depth)
+        left, right = layout.road.at(y)
         axis = self.project(np.array([[path_center(z), 0.0, z]]), camera, clip=False)
         if axis is None:
             return polygon
         # Bend the window banks around the ground corridor, raising or lowering the
         # convergence point with it. The ceiling may remain wider than the road.
-        offset = np.clip((left + right) * self.w / 2 - axis[0, 0], -0.33 * self.w, 0.33 * self.w)
+        center = np.clip((left + right) * self.w / 2, axis[0, 0] - 0.33 * self.w, axis[0, 0] + 0.33 * self.w)
+        nominal_width = 0.045 + 0.47 * ((y - top) / max(0.02, 1 - top))
+        scale = np.clip(0.84 + 0.16 * (right - left) / nominal_width, 0.86, 1.15)
         shift_y = np.clip(top - 0.49, -0.09, 0.16) * self.h
-        return polygon + [offset, shift_y]
+        adjusted = polygon.copy()
+        adjusted[:, 0] = center + (polygon[:, 0] - axis[0, 0]) * scale
+        adjusted[:, 1] += shift_y
+        return adjusted
 
-    def paint_road_treads(self, scene, source, road, t):
+    def paint_road_treads(self, scene, source, layout, t):
         phase = t * 0.62
-        top = road.edges[0, 0]
         for slot in range(18, -1, -1):
             # Space slices in depth so the visible gaps and treads converge together.
             distance = slot - (phase % 1)
-            near, far = top + (1.0 - top) / (1 + 0.48 * np.maximum(-0.20, [distance, distance + 0.69])) ** 1.24
+            near, far = road_depth(layout.top, [distance, distance + 0.63])
             if far >= 1.0 or near - far < 0.0025:
                 continue
-            y = np.repeat([near, far], 2)
-            left, right = road.at(y)
-            x = (left + right) * 0.5 + (right - left) * np.array([-0.46, 0.46, 0.46, -0.46])
-            polygon = np.column_stack((x * self.w, y * self.h))
+            polygon = layout.tread(near, far)
             delay = 0.13 + (slot + math.floor(phase)) * 0.145
             on = float(smooth(delay, delay + 0.36, t))
             depth_shade = 0.64 + 0.30 * math.exp(-0.19 * max(0, distance))
@@ -214,8 +311,10 @@ class Opening:
         camera = self.camera(t)
         scene = np.zeros_like(source)
         haze = np.zeros(self.light_size[::-1], np.float32)
+        layout = None if road is None else RoadLayout(road, self.w, self.h)
         focus = 0.50 if road is None else sum(road.at(0.79)) / 2
-        for z, lane, row, _, corners, delay in reversed(self.panels):
+        panels = reversed(self.panels) if layout is None else self.panels
+        for z, lane, row, _, corners, delay in panels:
             rise = 0.39 if row else 0.29
             on = float(smooth(delay, delay + rise, t))
             if on <= 0.0:
@@ -224,8 +323,14 @@ class Opening:
             if polygon is None:
                 continue
             depth = z - camera[0][2]
-            if road is not None:
-                polygon = self.road_windows(polygon, road, camera, z)
+            if layout is not None:
+                placement = layout.place_window(self.road_window(polygon, layout, camera, z), lane)
+                if placement is None:
+                    continue
+                polygon, visibility = placement
+                on *= visibility
+                if on <= 0.0:
+                    continue
                 center = np.rint(polygon.mean(axis=0)).astype(int)
                 x, y = np.clip(center, [0, 0], [self.w - 1, self.h - 1])
                 sky_light = float(smooth(47, 178, np.mean(source[max(0, y - 2):y + 3, max(0, x - 2):x + 3])))
@@ -242,8 +347,8 @@ class Opening:
             self.paint_panel(scene, source, polygon, intensity, lane, row, glint=glint)
             self.paint_beam(haze, polygon, beam * (1.0 + 0.40 * sky_light), lane, row, focus=focus)
 
-        if road is not None:
-            self.paint_road_treads(scene, source, road, t)
+        if layout is not None:
+            self.paint_road_treads(scene, source, layout, t)
         for index, (z, corners) in reversed(list(enumerate(self.steps if road is None else ()))):
             on = float(smooth(0.07 + index * 0.12, 0.37 + index * 0.12, t))
             if on <= 0.0:
