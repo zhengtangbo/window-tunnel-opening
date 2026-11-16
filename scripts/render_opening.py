@@ -107,7 +107,7 @@ class Opening:
             return None
         return screen
 
-    def paint_panel(self, scene, source, polygon, intensity, lane, row, floor=False, glint=0.0):
+    def paint_panel(self, scene, source, polygon, intensity, lane, row, floor=False, glint=0.0, road_blend=0.0):
         pad = 2
         x0, y0 = np.maximum(np.floor(polygon.min(axis=0)).astype(int) - pad, 0)
         x1, y1 = np.minimum(np.ceil(polygon.max(axis=0)).astype(int) + pad, [self.w, self.h])
@@ -127,6 +127,9 @@ class Opening:
             )
             tex = cv2.warpPerspective(stone, transform, (x1 - x0, y1 - y0), borderMode=cv2.BORDER_REPLICATE)
             values = tex.astype(np.float32) * np.array([0.60, 0.63, 0.69], dtype=np.float32) * intensity
+            if road_blend:
+                real_tread = source[y0:y1, x0:x1].astype(np.float32) * intensity
+                values += (real_tread - values) * road_blend
         else:
             dx = int(self.w * (0.017 * math.sin(row * 1.81 + lane * 0.88) + 0.013 * (lane - 4) / 4))
             dy = int(self.h * (0.023 * math.cos(row * 0.66 + lane * 1.32)))
@@ -174,7 +177,18 @@ class Opening:
         strength = (0.32 if lane in (2, 3, 6) else 0.10) * intensity * (0.82 + 0.14 * math.sin(row * 2.0 + lane))
         haze[y0:y1, x0:x1] += patch * (strength / 255.0) * fade
 
-    def render(self, source, frame):
+    def align_tread(self, polygon, road, blend):
+        # Project the near and far edges of the same tread onto the detected corridor.
+        y = polygon[:, 1] / self.h
+        top = max(0.49, road.edges[0, 0])
+        y = 1.0 - (1.0 - y) * (1.0 - top) / 0.30
+        y = np.repeat([y[:2].mean(), y[2:].mean()], 2)
+        left, right = road.at(y)
+        target_x = (left + right) / 2 + (right - left) * np.array([-0.46, 0.46, 0.46, -0.46])
+        target = np.column_stack((target_x * self.w, y * self.h))
+        return polygon + (target - polygon) * blend
+
+    def render(self, source, frame, road=None):
         t = frame / FPS
         camera = self.camera(t)
         scene = np.zeros_like(source)
@@ -199,6 +213,7 @@ class Opening:
             self.paint_panel(scene, source, polygon, intensity, lane, row, glint=glint)
             self.paint_beam(haze, polygon, beam, lane, row)
 
+        align = float(smooth(4.45, 6.05, t)) if road is not None else 0.0
         for index, (z, corners) in reversed(list(enumerate(self.steps))):
             on = float(smooth(0.07 + index * 0.12, 0.37 + index * 0.12, t))
             if on <= 0.0:
@@ -210,7 +225,15 @@ class Opening:
                 # A small reflection follows the row of windows onto the first treads.
                 ripple = math.exp(-((t - 0.72 - index * 0.20) / 0.36) ** 2)
                 light *= 1.0 + 0.17 * ripple
-                self.paint_panel(scene, source, polygon, on * light, 0, index, floor=True)
+                if align:
+                    polygon = self.align_tread(polygon, road, align)
+                    light = light * (1 - align) + (0.70 + 0.20 * math.exp(-0.10 * depth)) * align
+                    y = polygon[:, 1].mean() / self.h
+                    road_start = road.edges[0, 0]
+                    on *= 1.0 - align * (1.0 - float(smooth(road_start, road_start + 0.08, y)))
+                    if on <= 0.015:
+                        continue
+                self.paint_panel(scene, source, polygon, on * light, 0, index, floor=True, road_blend=align)
 
         scene = (scene * self.vignette[..., None]).astype(np.uint8)
         haze = 0.63 * cv2.GaussianBlur(haze, (0, 0), self.w * 0.004) + 0.37 * cv2.GaussianBlur(haze, (0, 0), self.w * 0.010)

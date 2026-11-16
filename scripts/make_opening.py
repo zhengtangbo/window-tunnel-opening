@@ -10,7 +10,8 @@ from tempfile import TemporaryDirectory
 import cv2
 import numpy as np
 
-from render_opening import FPS, OPEN_END, REFERENCE_FRAMES, WAVE_END, Opening
+from render_opening import FPS, OPEN_END, REFERENCE_FRAMES, WAVE_END, WAVE_START, Opening
+from road_alignment import road_for_frame, road_from_points, select_track
 
 
 WINDOWS = "透视窗格与踏板.mov"
@@ -77,15 +78,48 @@ def base_frame(base, frame_number, width, height):
     return np.frombuffer(raw, np.uint8).reshape(height, width, 3)
 
 
-def tread_texture(base, frames, width, height, point):
-    image = base_frame(base, min(frames - 1, round(frames * 0.70)), width, height)
+def tread_texture(base, frame, width, height, point, span=None):
+    image = base_frame(base, frame, width, height)
     x, y = point
-    patch_width = max(2, round(width * 0.09))
+    patch_width = max(2, round(width * min(0.09, span))) if span is not None else max(2, round(width * 0.09))
     patch_height = max(2, round(height * 0.054))
     left = min(width - patch_width, max(0, round(width * x - patch_width / 2)))
     top = min(height - patch_height, max(0, round(height * y - patch_height / 2)))
     patch = image[top:top + patch_height, left:left + patch_width]
     return cv2.resize(patch, (96, 42), interpolation=cv2.INTER_AREA)
+
+
+def find_road(base, motion_end, size, points, disabled, folder):
+    if disabled:
+        return [], "off"
+    if points:
+        return [(0, road_from_points(points))], "manual"
+    # Sample through the reveal, including the last few frames of the transition.
+    indices = sorted({round((motion_end - 1) * ref / WAVE_END)
+                      for ref in (145, 160, 174, WAVE_START, 188, 195, 201, WAVE_END)})
+    if len(indices) < 2:
+        return [], "unconfirmed"
+    width, height = size
+    scale = min(1, 640 / max(width, height))
+    width, height = max(4, round(width * scale)), max(4, round(height * scale))
+    selected = "+".join(f"eq(n\\,{frame})" for frame in indices)
+    raw = subprocess.check_output([
+        *FFMPEG, "-threads", "4", "-i", str(base), "-map", "0:v:0",
+        "-vf", f"select={selected},scale={width}:{height}", "-frames:v", str(len(indices)),
+        "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "bgr24", "-threads", "1", "-",
+    ])
+    images = np.frombuffer(raw, np.uint8).reshape(len(indices), height, width, 3)
+    track = select_track(list(zip(indices, images)))
+    if not track:
+        return [], "unconfirmed"
+    frame, road = min(track, key=lambda match: abs(match[0] - (motion_end - 1) * 195 / WAVE_END))
+    diagnostic = images[indices.index(frame)].copy()
+    rows = road.edges[:, 0] * height
+    for x in [road.edges[:, 1], road.edges[:, 2], road.edges[:, 1:].mean(axis=1)]:
+        line = np.rint(np.column_stack((x * width, rows))).astype(np.int32)
+        cv2.polylines(diagnostic, [line], False, (32, 226, 255), 2, cv2.LINE_AA)
+    cv2.imencode(".jpg", diagnostic)[1].tofile(folder / "road-check.jpg")
+    return track, "auto"
 
 
 def writer(path, width, height, alpha=False):
@@ -113,11 +147,20 @@ def alpha_frame(image, alpha):
     ]).tobytes()
 
 
-def render(folder, base, frames, size, point):
+def render(folder, base, frames, size, point, road_points=None, no_road=False):
     width, height = size
     opening = Opening(width, height)
-    opening.stone = tread_texture(base, frames, width, height, point)
     motion_end = max(2, min(frames - 1, math.ceil(OPEN_END * frames / REFERENCE_FRAMES)))
+    route, status = find_road(base, motion_end, size, road_points, no_road, folder)
+    texture_frame = min(frames - 1, round((motion_end - 1) * 192 / WAVE_END))
+    road = road_for_frame(route, texture_frame)
+    span = None
+    if not point and road is not None:
+        point = road.texture_point()
+        left, right = road.at(point[1])
+        span = float((right - left) * 0.44)
+    point = point or ((0.315, 0.835) if width >= height else (0.5, 0.81))
+    opening.stone = tread_texture(base, texture_frame, width, height, point, span)
     expected_bytes = width * height * 3
     with ExitStack() as cleanup:
         reader = cleanup.enter_context(subprocess.Popen([
@@ -135,7 +178,8 @@ def render(folder, base, frames, size, point):
             frame = np.frombuffer(data, np.uint8).reshape(height, width, 3)
             if index < motion_end:
                 sample = index * WAVE_END / (motion_end - 1)
-                scene, opacity, light, light_alpha, frame = opening.render(frame, sample)
+                road = road_for_frame(route, index) if sample >= 4.45 * FPS else None
+                scene, opacity, light, light_alpha, frame = opening.render(frame, sample, road)
                 scene_writer.stdin.write(alpha_frame(scene, opacity))
                 light_writer.stdin.write(alpha_frame(light, light_alpha))
                 if index == motion_end - 1:
@@ -147,7 +191,10 @@ def render(folder, base, frames, size, point):
         preview.stdin.close()
         if any(process.wait() for process in (reader, scene_writer, light_writer, preview)):
             raise RuntimeError("A decoder or encoder did not finish successfully")
-    return motion_end
+    metadata = {"status": status, "samples": [
+        {"frame": index, "edges": road.edges.round(5).tolist()} for index, road in route
+    ]}
+    return motion_end, metadata
 
 
 def make(args):
@@ -170,8 +217,7 @@ def make(args):
     base = folder / BASE_VIDEO
     stream, frames = prepare_base(source, base, args.start, args.seconds, args.mute)
     size = size_for(stream, 1920)
-    texture = args.texture or ((0.315, 0.835) if size[0] >= size[1] else (0.5, 0.81))
-    motion_end = render(folder, base, frames, size, texture)
+    motion_end, road = render(folder, base, frames, size, args.texture, args.road_point, args.no_road)
     cover_frame = min(frames - 1, motion_end + 6)
     cover = base_frame(base, cover_frame, *size)
     cv2.imencode(".jpg", cover)[1].tofile(folder / "draft_cover.jpg")
@@ -192,10 +238,10 @@ def make(args):
     manifest = {
         "source_name": source.name, "fps": FPS, "frames": frames, "motion_frames": motion_end,
         "width": stream["width"], "height": stream["height"], "preview_width": size[0], "preview_height": size[1],
-        "start_seconds": args.start, "preview": str(output),
+        "start_seconds": args.start, "preview": str(output), "road_alignment": road,
     }
     (folder / MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(manifest, ensure_ascii=False))
+    print(json.dumps({**manifest, "road_alignment": road["status"]}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
@@ -207,4 +253,7 @@ if __name__ == "__main__":
     parser.add_argument("--seconds", type=float, default=9)
     parser.add_argument("--mute", action="store_true")
     parser.add_argument("--texture", type=float, nargs=2, metavar=("X", "Y"))
+    road_options = parser.add_mutually_exclusive_group()
+    road_options.add_argument("--road-point", type=float, nargs=3, action="append", metavar=("X", "Y", "WIDTH"))
+    road_options.add_argument("--no-road", action="store_true", help="Keep the original tread motion")
     make(parser.parse_args())
